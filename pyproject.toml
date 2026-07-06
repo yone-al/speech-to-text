@@ -1,0 +1,22 @@
+[project]
+name = "speech-to-text"
+version = "0.1.0"
+description = "動画・音声ファイルをローカルで文字起こしする CLI(Whisper large-v3 / Apple Silicon GPU / 話者分離対応)"
+requires-python = ">=3.12"
+dependencies = [
+    "mlx-whisper>=0.4.3",
+    "pyannote-audio>=4.0.7",
+]
+
+[tool.ruff.lint]
+# 既定 (E4/E7/E9/F) に加えて、実バグ検出とモダン化に効くルール群を採用。
+# select = ["ALL"] は formatter と競合するルールや文脈違いのルール
+# (T201: print 禁止など、CLI ツールに合わないもの)を含むため使わない。
+extend-select = [
+    "W",   # 空白まわりの警告
+    "I",   # import の並び順
+    "B",   # bugbear: ありがちなバグパターン
+    "UP",  # 古い書き方の検出 (pyupgrade)
+    "SIM", # 単純化できるコード
+    "RUF", # Ruff 独自ルール
+]

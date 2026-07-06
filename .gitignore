@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+
+# 文字起こしの入出力(音声・動画・結果を誤って公開しないため)
+*.mp3
+*.mp4
+*.wav
+*.m4a
+*.aiff
+*.mov
+*.mkv
+*.flac
+*.srt
+*.vtt
+out/
+
+# macOS
+.DS_Store

@@ -1,0 +1,17 @@
+{
+  // ユーザー設定 (select: ALL) ではなく pyproject.toml の [tool.ruff.lint] を使う
+  "ruff.configurationPreference": "filesystemFirst",
+  // プロジェクト固有の固有名詞をスペルチェッカーに教える
+  "cSpell.words": [
+    "pyannote",
+    "huggingface",
+    "itertracks",
+    "diarization",
+    "diarize",
+    "pycache",
+    "venv",
+    "WEBVTT",
+    "loudnorm",
+    "flac"
+  ]
+}
