@@ -1,8 +1,10 @@
 #!/usr/bin/env -S uv run
 """動画・音声ファイルをローカルで文字起こしする CLI。
 
-Whisper large-v3 (mlx-whisper, Apple Silicon GPU) で認識し、
-オプションで pyannote.audio による話者分離を行う。
+Whisper large-v3 で認識し、オプションで pyannote.audio による話者分離を行う。
+エンジンは実行環境で自動切替:
+    - Apple Silicon Mac: mlx-whisper (Metal GPU)
+    - Windows / Linux:   faster-whisper (NVIDIA GPU があれば CUDA、なければ CPU)
 
 使い方:
     uv run transcribe.py input.mp4                  # テキスト (.txt) を出力
@@ -15,6 +17,10 @@ Whisper large-v3 (mlx-whisper, Apple Silicon GPU) で認識し、
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,8 +28,12 @@ import time
 from pathlib import Path
 
 # 精度優先で large-v3(非 turbo)を既定にしている。速度優先なら --model で
-# mlx-community/whisper-large-v3-turbo に切替可能(約8倍速・精度は僅かに低下)。
-DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
+# turbo 系(mlx: mlx-community/whisper-large-v3-turbo / faster-whisper:
+# large-v3-turbo)に切替可能(約8倍速・精度は僅かに低下)。
+DEFAULT_MODELS = {
+    "mlx": "mlx-community/whisper-large-v3-mlx",
+    "faster-whisper": "large-v3",
+}
 
 # pyannote.audio 4.x 用の現行パイプライン。gated モデルのため HF トークンと
 # モデルページ (https://hf.co/pyannote/speaker-diarization-community-1) での同意が必要。
@@ -43,12 +53,33 @@ Turn = tuple[float, float, str]
 # ---------------------------------------------------------------- 文字起こし
 
 
-def transcribe_file(path: Path, model: str, language: str | None) -> dict:
-    """mlx-whisper で認識し、Whisper 形式の結果 dict を返す。
+def pick_backend() -> str:
+    """実行環境に合った文字起こしエンジンを選ぶ。
+
+    Apple Silicon は MLX (Metal GPU)、それ以外は faster-whisper。
+    STT_BACKEND 環境変数(mlx / faster-whisper)で強制切替も可能。
+    """
+    forced = os.environ.get("STT_BACKEND")
+    if forced:
+        return forced
+    if sys.platform == "darwin" and platform.machine() == "arm64":
+        return "mlx"
+    return "faster-whisper"
+
+
+def transcribe_file(path: Path, model: str, language: str | None, backend: str) -> dict:
+    """指定エンジンで認識し、Whisper 形式の結果 dict を返す。
 
     入力は ffmpeg がデコードできる形式ならなんでもよい(動画も可)。
-    mlx_whisper が内部で ffmpeg を呼んで音声トラックを取り出すため。
+    どちらのエンジンも内部で ffmpeg を呼んで音声トラックを取り出すため。
     """
+    if backend == "mlx":
+        return transcribe_mlx(path, model, language)
+    return transcribe_faster_whisper(path, model, language)
+
+
+def transcribe_mlx(path: Path, model: str, language: str | None) -> dict:
+    """mlx-whisper (Apple Silicon の Metal GPU) で認識する。"""
     # import が遅い(数秒)ので、実際に使う関数内で読み込む
     import mlx_whisper
 
@@ -58,6 +89,53 @@ def transcribe_file(path: Path, model: str, language: str | None) -> dict:
         language=language,  # None なら自動検出
         verbose=False,  # False: 進捗バーのみ表示
     )
+
+
+# 読み込み済みの faster-whisper モデル(モデル名 → WhisperModel)
+_fw_models: dict[str, object] = {}
+
+
+def transcribe_faster_whisper(path: Path, model: str, language: str | None) -> dict:
+    """faster-whisper (CTranslate2) で認識し、mlx-whisper と同じ形の dict に揃える。
+
+    NVIDIA GPU (CUDA) があれば float16 で GPU 実行、なければ int8 量子化で CPU 実行。
+    """
+    try:
+        import ctranslate2
+        from faster_whisper import WhisperModel
+    except ImportError:
+        # pyproject のマーカーにより Apple Silicon にはインストールされない
+        sys.exit(
+            "エラー: faster-whisper がインストールされていません。\n"
+            "Apple Silicon Mac では mlx エンジン(既定)を使用してください"
+        )
+    from tqdm import tqdm
+
+    whisper = _fw_models.get(model)
+    if whisper is None:
+        if ctranslate2.get_cuda_device_count() > 0:
+            # 注意: cuDNN 未導入でもここは成功し、認識実行時に C++ 層でプロセスが
+            # 即死する(Python から捕捉不能)。突然終了する場合は README の GPU 節を参照
+            whisper = WhisperModel(model, device="cuda", compute_type="float16")
+        else:
+            print(
+                "  (NVIDIA GPU を検出できないため CPU で実行します — 時間がかかります。"
+                "GPU があるのに表示される場合はドライバ等を確認 — README 参照)"
+            )
+            whisper = WhisperModel(model, device="cpu", compute_type="int8")
+        # バッチ処理でファイルごとに数 GB のモデルを再ロードしないようキャッシュ
+        # (mlx 側はライブラリ内部でキャッシュされるため不要)
+        _fw_models[model] = whisper
+
+    # transcribe() は遅延評価のジェネレータを返し、回した分だけ認識が進む。
+    # 「処理済みの音声秒数 / 総秒数」で進捗バーを描画しながら回収する
+    segments_iter, info = whisper.transcribe(str(path), language=language)
+    segments = []
+    with tqdm(total=round(info.duration, 2), unit="s", leave=False) as bar:
+        for s in segments_iter:
+            segments.append({"start": s.start, "end": s.end, "text": s.text})
+            bar.update(round(s.end - bar.n, 2))
+    return {"segments": segments, "language": info.language}
 
 
 # ---------------------------------------------------------------- 話者分離
@@ -71,6 +149,12 @@ def resolve_hf_token(cli_token: str | None) -> str | None:
     from huggingface_hub import get_token
 
     return get_token()
+
+
+def ffmpeg_install_hint() -> str:
+    """OS に応じた ffmpeg のインストールコマンド例を返す。"""
+    hints = {"darwin": "brew install ffmpeg", "win32": "winget install ffmpeg"}
+    return hints.get(sys.platform, "apt install ffmpeg など")
 
 
 def extract_wav(src: Path, dst: Path) -> None:
@@ -95,7 +179,7 @@ def extract_wav(src: Path, dst: Path) -> None:
         )
     except FileNotFoundError:
         sys.exit(
-            "エラー: ffmpeg が見つかりません。`brew install ffmpeg` でインストールしてください"
+            f"エラー: ffmpeg が見つかりません。`{ffmpeg_install_hint()}` でインストールしてください"
         )
     except subprocess.CalledProcessError as e:
         # 失敗理由(音声トラックなし・ファイル破損など)は stderr にしか出ない
@@ -126,7 +210,10 @@ def load_diarization_pipeline(token: str):
             "エラー: 話者分離モデルを取得できませんでした。\n" + DIARIZE_SETUP_GUIDE
         )
 
-    if torch.backends.mps.is_available():
+    if torch.cuda.is_available():
+        # NVIDIA GPU (CUDA) で実行。Windows/Linux は CUDA 版 torch が必要 (README 参照)
+        pipeline.to(torch.device("cuda"))
+    elif torch.backends.mps.is_available():
         # Apple Silicon の GPU (Metal) で実行
         pipeline.to(torch.device("mps"))
     else:
@@ -136,7 +223,9 @@ def load_diarization_pipeline(token: str):
 
 def run_diarization(pipeline, path: Path, num_speakers: int | None) -> list[Turn]:
     """話者分離を実行し、話者区間のリストを返す。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # ignore_cleanup_errors: Windows ではウイルス対策等が wav を開いたままにして
+    # 削除に失敗することがあるため、後始末の失敗で処理全体を落とさない
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         wav = Path(tmpdir) / "audio.wav"
         extract_wav(path, wav)
         kwargs = {"num_speakers": num_speakers} if num_speakers is not None else {}
@@ -227,11 +316,17 @@ def process(path: Path, args: argparse.Namespace, diarization_pipeline=None) -> 
     out_dir.mkdir(parents=True, exist_ok=True)
     base = out_dir / path.stem
 
-    print(f"* 文字起こし中: {path.name} (model: {args.model})")
+    print(f"* 文字起こし中: {path.name} (engine: {args.backend}, model: {args.model})")
     t0 = time.time()
-    result = transcribe_file(path, args.model, args.language)
+    result = transcribe_file(path, args.model, args.language, args.backend)
     segments = result["segments"]
     print(f"  完了 ({time.time() - t0:.1f}s, 言語: {result['language']})")
+    if not segments:
+        print("  (認識されたセグメントは 0 件でした — 無音の可能性があります)")
+
+    # 後段の話者分離が失敗しても文字起こし結果が失われないよう、まず保存する
+    # (話者分離が成功したら話者ラベル付きで上書きされる)
+    write_txt(segments, base.with_suffix(".txt"))
 
     if diarization_pipeline is not None:
         print("* 話者分離中...")
@@ -260,6 +355,15 @@ def positive_int(value: str) -> int:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        # 日本語 Windows でリダイレクト時に stdout が cp932 になり、
+        # cp932 に無い文字(— など)で UnicodeEncodeError になるのを防ぐ。
+        # コンソール無し起動 (pythonw) では stream が None のことがあるため防御する
+        for stream in (sys.stdout, sys.stderr):
+            # 失敗しても文字化け防止が効かないだけなので処理は続行してよい
+            with contextlib.suppress(AttributeError, ValueError, OSError):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="動画・音声ファイルをローカルで文字起こしする",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -267,8 +371,8 @@ def main() -> None:
     parser.add_argument("inputs", nargs="+", type=Path, help="動画または音声ファイル")
     parser.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
-        help="Whisper モデル(速度優先: mlx-community/whisper-large-v3-turbo)",
+        default=None,
+        help="Whisper モデル(既定: エンジンに応じた large-v3。速度優先なら turbo 系)",
     )
     parser.add_argument(
         "--language", default=None, help="言語コード (ja, en など)。未指定なら自動検出"
@@ -292,6 +396,23 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # 実行環境に合ったエンジンと既定モデルを決める
+    args.backend = pick_backend()
+    if args.backend not in DEFAULT_MODELS:
+        sys.exit(
+            f"エラー: 未知のエンジンです: {args.backend}"
+            f"(STT_BACKEND には {' / '.join(DEFAULT_MODELS)} を指定)"
+        )
+    if args.backend == "mlx" and (
+        sys.platform != "darwin" or platform.machine() != "arm64"
+    ):
+        # mlx-whisper は Apple Silicon 以外にはインストールされない(pyproject のマーカー)
+        sys.exit(
+            "エラー: mlx エンジンは Apple Silicon Mac 専用です(STT_BACKEND を確認)"
+        )
+    if args.model is None:
+        args.model = DEFAULT_MODELS[args.backend]
+
     if not args.diarize and (args.num_speakers is not None or args.hf_token):
         print("警告: --num-speakers / --hf-token は --diarize 指定時のみ使われます")
 
@@ -299,6 +420,13 @@ def main() -> None:
     missing = [str(p) for p in args.inputs if not p.is_file()]
     if missing:
         sys.exit("エラー: ファイルが見つかりません: " + ", ".join(missing))
+
+    # ffmpeg は文字起こし(エンジン内部)と話者分離の両方で必須。
+    # 長時間処理の後に「ffmpeg がない」で成果を失わないよう最初に確認する
+    if shutil.which("ffmpeg") is None:
+        sys.exit(
+            f"エラー: ffmpeg が見つかりません。`{ffmpeg_install_hint()}` でインストールしてください"
+        )
 
     # 出力先の衝突検知: a.mp3 と a.mp4 を同時に渡すと、どちらの結果も
     # a.txt に書かれて片方が消えるのを防ぐ

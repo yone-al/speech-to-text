@@ -1,12 +1,36 @@
 [project]
 name = "speech-to-text"
 version = "0.1.0"
-description = "動画・音声ファイルをローカルで文字起こしする CLI(Whisper large-v3 / Apple Silicon GPU / 話者分離対応)"
+description = "動画・音声ファイルをローカルで文字起こしする CLI(Whisper large-v3 / GPU 対応 / 話者分離対応)"
 requires-python = ">=3.12"
 dependencies = [
-    "mlx-whisper>=0.4.3",
+    # 文字起こしエンジンは OS で切替: Apple Silicon は MLX (Metal GPU)、
+    # それ以外 (Windows/Linux) は faster-whisper (CUDA GPU or CPU)
+    "mlx-whisper>=0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "faster-whisper>=1.2.1; sys_platform != 'darwin' or platform_machine != 'arm64'",
+    # ctranslate2 は faster-whisper の内部実装だが、CUDA 検出で直接 import している
+    "ctranslate2>=4.8; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "pyannote-audio>=4.0.7",
+    # torch は transcribe.py が直接 import している。直接依存にすることで
+    # 下の [tool.uv.sources] による CUDA 版への差し替え(Windows)も効く。
+    # 対応ペアは torch 2.12 ↔ torchaudio 2.11(2025 年からバージョン系列が別)
+    "torch>=2.12",
+    "torchaudio>=2.11",
+    "tqdm>=4.60",  # faster-whisper 経路の進捗バー表示で直接 import している
 ]
+
+# Windows の PyPI 版 torch は CPU ビルドのため、CUDA 版を PyTorch 公式
+# インデックスから取る(Linux の PyPI 版は元から CUDA 対応、macOS は無関係)。
+# これで pyannote(話者分離)も NVIDIA GPU で動く。
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+# AMD64 限定: cu126 インデックスに Windows ARM64 用 wheel は無いため
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" }]
+torchaudio = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32' and platform_machine == 'AMD64'" }]
 
 [tool.ruff.lint]
 # 既定 (E4/E7/E9/F) に加えて、実バグ検出とモダン化に効くルール群を採用。
