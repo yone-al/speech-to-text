@@ -135,6 +135,10 @@ def transcribe_faster_whisper(path: Path, model: str, language: str | None) -> d
         for s in segments_iter:
             segments.append({"start": s.start, "end": s.end, "text": s.text})
             bar.update(round(s.end - bar.n, 2))
+        if bar.total is not None and bar.n < bar.total:
+            # 最後の認識セグメント終端が総尺より前の場合でも、処理完了時は
+            # 進捗バーを 100% にしてから閉じる。
+            bar.update(bar.total - bar.n)
     return {"segments": segments, "language": info.language}
 
 
@@ -414,7 +418,10 @@ def main() -> None:
         args.model = DEFAULT_MODELS[args.backend]
 
     if not args.diarize and (args.num_speakers is not None or args.hf_token):
-        print("警告: --num-speakers / --hf-token は --diarize 指定時のみ使われます")
+        print(
+            "警告: --num-speakers / --hf-token は --diarize 指定時のみ使われます",
+            file=sys.stderr,
+        )
 
     # 入力の一括検証: 処理を始めてから typo に気づくと、それまでの処理時間が無駄になる
     missing = [str(p) for p in args.inputs if not p.is_file()]
