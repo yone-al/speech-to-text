@@ -5,6 +5,8 @@ __pycache__/
 .ruff_cache/
 
 # 文字起こしの入出力(音声・動画・結果を誤って公開しないため)
+input/
+output/
 *.txt
 *.mp3
 *.mp4

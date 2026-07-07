@@ -7,6 +7,7 @@ Whisper large-v3 で認識し、オプションで pyannote.audio による話�
     - Windows / Linux:   faster-whisper (NVIDIA GPU があれば CUDA、なければ CPU)
 
 使い方:
+    uv run transcribe.py                            # input/ 内をまとめて処理し output/ に出力
     uv run transcribe.py input.mp4                  # テキスト (.txt) を出力
     uv run transcribe.py input.mp4 --srt --vtt      # 字幕ファイルも出力
     uv run transcribe.py input.mp4 --language ja    # 言語を固定(既定: 自動検出)
@@ -48,6 +49,64 @@ DIARIZE_SETUP_GUIDE = (
 
 # (開始秒, 終了秒, 話者ラベル) — pyannote の出力
 Turn = tuple[float, float, str]
+
+# 入力を省略したときに使う既定ディレクトリ。input/ に置いた音声・動画を
+# まとめて文字起こしし、結果を output/ に書き出す(単体ファイル指定時は従来通り)。
+DEFAULT_INPUT_DIR = "input"
+DEFAULT_OUTPUT_DIR = "output"
+
+# ディレクトリを入力に指定したときに拾う拡張子(ffmpeg が読める代表的な音声・動画)。
+MEDIA_EXTENSIONS = {
+    # 動画
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".flv",
+    ".ts",
+    ".mpg",
+    ".mpeg",
+    ".wmv",
+    # 音声
+    ".mp3",
+    ".wav",
+    ".m4a",
+    ".aac",
+    ".flac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".aiff",
+    ".aif",
+    ".wma",
+}
+
+
+def collect_media_in_dir(directory: Path) -> list[Path]:
+    """ディレクトリ直下(サブフォルダは見ない)の音声・動画ファイルを名前順で集める。
+
+    隠しファイルは除外する。特に SMB/FAT 上で macOS が作る AppleDouble
+    (._movie.mp4 など)は拡張子が本体と同じで、ffmpeg が読めず失敗するため。
+    """
+    return sorted(
+        p
+        for p in directory.iterdir()
+        if p.is_file()
+        and not p.name.startswith(".")
+        and p.suffix.lower() in MEDIA_EXTENSIONS
+    )
+
+
+def output_base(path: Path, output_dir: str | None) -> Path:
+    """出力ファイルのパス(拡張子抜き)を決める。
+
+    出力先の指定がなければ入力ファイルと同じ場所。出力衝突検知と実際の
+    書き込みの両方がこの関数を使うことで、検査対象と書き込み先のずれを防ぐ。
+    """
+    out_dir = Path(output_dir) if output_dir else path.parent
+    return out_dir / path.stem
 
 
 # ---------------------------------------------------------------- 文字起こし
@@ -316,9 +375,8 @@ def write_vtt(segments: list[dict], path: Path) -> None:
 
 
 def process(path: Path, args: argparse.Namespace, diarization_pipeline=None) -> None:
-    out_dir = Path(args.output_dir) if args.output_dir else path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base = out_dir / path.stem
+    base = output_base(path, args.output_dir)
+    base.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"* 文字起こし中: {path.name} (engine: {args.backend}, model: {args.model})")
     t0 = time.time()
@@ -372,7 +430,15 @@ def main() -> None:
         description="動画・音声ファイルをローカルで文字起こしする",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("inputs", nargs="+", type=Path, help="動画または音声ファイル")
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        type=Path,
+        help=(
+            "動画・音声ファイル、またはそれらを含むディレクトリ。"
+            "未指定なら input/ 内を処理して output/ に出力"
+        ),
+    )
     parser.add_argument(
         "--model",
         default=None,
@@ -399,6 +465,46 @@ def main() -> None:
         "--output-dir", default=None, help="出力先ディレクトリ(既定: 入力と同じ場所)"
     )
     args = parser.parse_args()
+
+    # 入力未指定なら「input/ を指定された」ものとして扱い、output/ に出力する
+    # (収集や空チェックは下のディレクトリ展開に一本化する)。
+    if not args.inputs:
+        default_input_dir = Path(DEFAULT_INPUT_DIR)
+        if default_input_dir.exists() and not default_input_dir.is_dir():
+            sys.exit(f"エラー: {DEFAULT_INPUT_DIR} がディレクトリではありません")
+        if not default_input_dir.is_dir():
+            sys.exit(
+                f"エラー: 入力が指定されておらず、{DEFAULT_INPUT_DIR}/ も見つかりません。\n"
+                f"{DEFAULT_INPUT_DIR}/ を作成して音声・動画ファイルを置くか、"
+                "ファイルやディレクトリを直接指定してください"
+            )
+        args.inputs = [default_input_dir]
+        if args.output_dir is None:
+            args.output_dir = DEFAULT_OUTPUT_DIR
+
+    # ディレクトリが指定された場合は、その直下の音声・動画ファイルに展開する。
+    expanded_inputs: list[Path] = []
+    empty_dirs: list[str] = []
+    for path in args.inputs:
+        if path.is_dir():
+            media_files = collect_media_in_dir(path)
+            if not media_files:
+                empty_dirs.append(str(path))
+            expanded_inputs.extend(media_files)
+        else:
+            expanded_inputs.append(path)
+    # ディレクトリと中のファイルを両方指定した場合などの重複を除く(順序は維持)。
+    # resolve() はシンボリックリンクの解決で出力先や表示名まで変えてしまうため、
+    # 指定されたパスのまま比較する(表記違いの同一ファイルは出力衝突検知が捕まえる)
+    args.inputs = list(dict.fromkeys(expanded_inputs))
+    if empty_dirs:
+        print(
+            "警告: 対応する音声・動画ファイルがないディレクトリをスキップしました: "
+            + ", ".join(empty_dirs),
+            file=sys.stderr,
+        )
+    if not args.inputs:
+        sys.exit("エラー: 処理対象の音声・動画ファイルがありません")
 
     # 実行環境に合ったエンジンと既定モデルを決める
     args.backend = pick_backend()
@@ -439,8 +545,7 @@ def main() -> None:
     # a.txt に書かれて片方が消えるのを防ぐ
     planned: dict[Path, Path] = {}
     for path in args.inputs:
-        out_dir = Path(args.output_dir) if args.output_dir else path.parent
-        base = out_dir / path.stem
+        base = output_base(path, args.output_dir)
         if base in planned:
             sys.exit(
                 f"エラー: {planned[base]} と {path} は出力先が同じ ({base}.txt) になります。\n"

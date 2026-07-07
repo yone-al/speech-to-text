@@ -29,6 +29,9 @@ cd speech-to-text
 入力ファイルはリポジトリ内に置く必要はなく、任意のパスを指定できる(例: `uv run transcribe.py ~/Movies/meeting.mp4`)。
 
 ```sh
+# input/ に置いた音声・動画をまとめて処理し、output/ に出力
+uv run transcribe.py
+
 # 基本: テキスト (.txt) を入力ファイルと同じ場所に出力
 uv run transcribe.py input.mp4
 
@@ -41,10 +44,17 @@ uv run transcribe.py input.mp4 --language ja
 # 複数ファイル + 出力先指定
 uv run transcribe.py a.mp3 b.mp4 --output-dir out/
 
+# ディレクトリを指定(直下の音声・動画をまとめて処理)
+uv run transcribe.py input --output-dir output
+
 # 速度優先モデルに切替(約8倍速・精度は僅かに低下)
 uv run transcribe.py input.mp4 --model mlx-community/whisper-large-v3-turbo  # Mac
 uv run transcribe.py input.mp4 --model large-v3-turbo                        # Windows/Linux
 ```
+
+出力先のルール: `--output-dir` を指定すればそこへ、未指定なら**入力ファイルと同じ場所**に出力する(ディレクトリを指定した場合も同様で、そのディレクトリ内に出力される)。例外として引数を完全に省略した場合のみ、`input/` 直下を処理して `output/` に出力する。
+
+ディレクトリ指定時はサブディレクトリ内までは探索せず、対応拡張子の音声・動画のみを拾う(隠しファイルは無視)。
 
 初回実行時に Whisper large-v3 モデル(約3GB)が `~/.cache/huggingface/` にダウンロードされる。2回目以降はオフラインで動作する。
 
