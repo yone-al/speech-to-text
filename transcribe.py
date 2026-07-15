@@ -47,6 +47,19 @@ DIARIZE_SETUP_GUIDE = (
     "  3. `uv run hf auth login` でトークンを登録(または HF_TOKEN 環境変数 / --hf-token)"
 )
 
+# 繰り返し・幻覚の抑制オプション(mlx-whisper / faster-whisper 共通のシグネチャ)。
+# - condition_on_previous_text=False: 直前窓のテキストを次窓のプロンプトに使わない。
+#   既定の True は一度繰り返しが始まると後続の窓に伝播して自己増幅するため、
+#   同じ文が延々と続く出力の主要因になる(用語の一貫性より安定性を優先)。
+# - hallucination_silence_threshold: 発話終端の後にこの秒数以上の無音が残る窓を
+#   幻覚の温床とみなしてスキップする。word_timestamps=True が実装上の前提
+#   (単語境界がないと無音区間を判定できない)。
+ANTI_HALLUCINATION_OPTIONS = {
+    "condition_on_previous_text": False,
+    "word_timestamps": True,
+    "hallucination_silence_threshold": 2.0,
+}
+
 # (開始秒, 終了秒, 話者ラベル) — pyannote の出力
 Turn = tuple[float, float, str]
 
@@ -147,6 +160,7 @@ def transcribe_mlx(path: Path, model: str, language: str | None) -> dict:
         path_or_hf_repo=model,
         language=language,  # None なら自動検出
         verbose=False,  # False: 進捗バーのみ表示
+        **ANTI_HALLUCINATION_OPTIONS,
     )
 
 
@@ -188,7 +202,14 @@ def transcribe_faster_whisper(path: Path, model: str, language: str | None) -> d
 
     # transcribe() は遅延評価のジェネレータを返し、回した分だけ認識が進む。
     # 「処理済みの音声秒数 / 総秒数」で進捗バーを描画しながら回収する
-    segments_iter, info = whisper.transcribe(str(path), language=language)
+    # vad_filter: 無音・非音声区間を認識前に除去する(Silero VAD)。幻覚の
+    # 発生源を減らせる。mlx-whisper に相当機能はないため faster-whisper のみ
+    segments_iter, info = whisper.transcribe(
+        str(path),
+        language=language,
+        vad_filter=True,
+        **ANTI_HALLUCINATION_OPTIONS,
+    )
     segments = []
     with tqdm(total=round(info.duration, 2), unit="s", leave=False) as bar:
         for s in segments_iter:
