@@ -44,6 +44,9 @@ uv run transcribe.py input.mp4 --language ja
 # 複数ファイル + 出力先指定
 uv run transcribe.py a.mp3 b.mp4 --output-dir out/
 
+# ワイルドカード指定(PowerShell を含む全 OS で利用可能)
+uv run transcribe.py "input/*.mp3" --output-dir out/
+
 # ディレクトリを指定(直下の音声・動画をまとめて処理)
 uv run transcribe.py input --output-dir output
 

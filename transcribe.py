@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import os
 import platform
 import shutil
@@ -26,6 +27,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
+import wave
 from pathlib import Path
 
 # 精度優先で large-v3(非 turbo)を既定にしている。速度優先なら --model で
@@ -110,6 +113,25 @@ def collect_media_in_dir(directory: Path) -> list[Path]:
         and not p.name.startswith(".")
         and p.suffix.lower() in MEDIA_EXTENSIONS
     )
+
+
+def expand_input_patterns(paths: list[Path]) -> list[Path]:
+    """入力パスに含まれるワイルドカードを OS に依存せず展開する。
+
+    macOS/Linux の一般的なシェルは ``*.mp3`` をコマンド実行前に展開する一方、
+    Windows PowerShell はネイティブコマンドへの引数をそのまま渡す。その差を
+    CLI 側で吸収する。マッチしないパターンは残し、後段の一括検証で通常の
+    「ファイルが見つかりません」エラーとして報告する。
+    """
+    expanded: list[Path] = []
+    for path in paths:
+        pattern = os.fspath(path)
+        matches = sorted(glob.glob(pattern)) if glob.has_magic(pattern) else []
+        if matches:
+            expanded.extend(Path(match) for match in matches)
+        else:
+            expanded.append(path)
+    return expanded
 
 
 def output_base(path: Path, output_dir: str | None) -> Path:
@@ -255,11 +277,17 @@ def extract_wav(src: Path, dst: Path) -> None:
                 "1",
                 "-ar",
                 "16000",
+                "-c:a",
+                "pcm_s16le",
                 str(dst),
             ],
             check=True,
             capture_output=True,
             text=True,
+            # Windows の既定ロケールが CP932 でも、ffmpeg はパス等を UTF-8 で
+            # 出力することがある。デコード失敗で reader thread を落とさない。
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         sys.exit(
@@ -270,6 +298,32 @@ def extract_wav(src: Path, dst: Path) -> None:
         raise RuntimeError(f"音声抽出に失敗しました:\n{e.stderr.strip()}") from e
 
 
+def load_wav_for_pyannote(path: Path) -> dict:
+    """16-bit PCM WAV を pyannote のメモリ入力形式に読み込む。
+
+    pyannote 4.x のパス入力は TorchCodec によるデコードを使うが、Windows では
+    PyTorch・TorchCodec・ffmpeg DLL の組み合わせによって読み込みに失敗しやすい。
+    直前に ffmpeg で形式を固定した WAV を標準ライブラリで読み、TorchCodec を
+    通さず ``{"waveform": Tensor, "sample_rate": int}`` として渡す。
+    """
+    import torch
+
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+
+    if sample_width != 2:
+        raise RuntimeError(
+            f"話者分離用 WAV のサンプル幅が不正です: {sample_width * 8} bit"
+        )
+
+    samples = torch.frombuffer(bytearray(frames), dtype=torch.int16)
+    waveform = samples.reshape(-1, channels).T.to(torch.float32) / 32768.0
+    return {"waveform": waveform, "sample_rate": sample_rate}
+
+
 def load_diarization_pipeline(token: str):
     """pyannote の話者分離パイプラインを読み込む(1回読み込んで全ファイルで使い回す)。
 
@@ -278,11 +332,20 @@ def load_diarization_pipeline(token: str):
     処理開始前にこれを呼ぶこと。
     """
     import torch
-    from pyannote.audio import Pipeline
+
+    # パス入力用 TorchCodec の警告は、run_diarization でメモリ入力を渡すため該当しない。
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="torchcodec is not installed correctly",
+            category=UserWarning,
+            module="pyannote.audio.core.io",
+        )
+        from pyannote.audio import Pipeline
 
     try:
         pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, token=token)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — 外部ライブラリの例外型が一定しない
         sys.exit(
             f"エラー: 話者分離モデルの取得に失敗しました: {e}\n"
             "モデルページで利用条件に同意していない可能性があります。\n"
@@ -312,9 +375,10 @@ def run_diarization(pipeline, path: Path, num_speakers: int | None) -> list[Turn
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
         wav = Path(tmpdir) / "audio.wav"
         extract_wav(path, wav)
+        audio = load_wav_for_pyannote(wav)
         kwargs = {"num_speakers": num_speakers} if num_speakers is not None else {}
         # pyannote 4.x は DiarizeOutput を返す(3.x は Annotation を直接返していた)
-        annotation = pipeline(str(wav), **kwargs).speaker_diarization
+        annotation = pipeline(audio, **kwargs).speaker_diarization
 
     return [
         (turn.start, turn.end, speaker)
@@ -456,7 +520,7 @@ def main() -> None:
         nargs="*",
         type=Path,
         help=(
-            "動画・音声ファイル、またはそれらを含むディレクトリ。"
+            "動画・音声ファイル、ワイルドカード、またはそれらを含むディレクトリ。"
             "未指定なら input/ 内を処理して output/ に出力"
         ),
     )
@@ -502,6 +566,9 @@ def main() -> None:
         args.inputs = [default_input_dir]
         if args.output_dir is None:
             args.output_dir = DEFAULT_OUTPUT_DIR
+
+    # PowerShell は *.mp3 などを展開しないため、まず CLI 側で展開する。
+    args.inputs = expand_input_patterns(args.inputs)
 
     # ディレクトリが指定された場合は、その直下の音声・動画ファイルに展開する。
     expanded_inputs: list[Path] = []
@@ -590,7 +657,7 @@ def main() -> None:
     for path in args.inputs:
         try:
             process(path, args, diarization_pipeline)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — 1件の失敗でバッチ全体を止めない
             failed.append(path.name)
             print(f"エラー: {path.name} の処理に失敗しました: {e}", file=sys.stderr)
     if failed:
