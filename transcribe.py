@@ -337,7 +337,7 @@ def load_diarization_pipeline(token: str):
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
-            message="torchcodec is not installed correctly",
+            message=r"(?s)\s*torchcodec is not installed correctly.*",
             category=UserWarning,
             module="pyannote.audio.core.io",
         )
